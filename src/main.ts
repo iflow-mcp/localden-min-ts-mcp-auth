@@ -1,8 +1,4 @@
-/**
- * EXPERIMENTAL: TypeScript MCP Server with OAuth-based authorization via Keycloak.
- * For demo purposes only.
- */
-
+ 
 import 'dotenv/config';
 import express from "express";
 import { randomUUID } from "node:crypto";
@@ -25,7 +21,6 @@ const CONFIG = {
     clientId: process.env.OAUTH_CLIENT_ID || "mcp-server",
     clientSecret: process.env.OAUTH_CLIENT_SECRET || "",
   },
-  strictOAuth: false,
 };
 
 function createOAuthUrls() {
@@ -41,35 +36,9 @@ function createOAuthUrls() {
 function createRequestLogger() {
   return (req: any, res: any, next: any) => {
     const start = Date.now();
-    const chunks: Buffer[] = [];
-    const originalWrite = res.write.bind(res);
-    const originalEnd = res.end.bind(res);
-
-    res.write = ((chunk: any, ...args: any[]) => {
-      if (chunk !== undefined && chunk !== null) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      return originalWrite(chunk, ...args);
-    }) as typeof res.write;
-
-    res.end = ((chunk?: any, ...args: any[]) => {
-      if (chunk !== undefined && chunk !== null) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      res.locals.__responseBody = Buffer.concat(chunks).toString('utf8');
-      return originalEnd(chunk, ...args);
-    }) as typeof res.end;
-
     res.on('finish', () => {
-      const duration = Date.now() - start;
-      const length = res.get('Content-Length') ?? '-';
-      console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${length}b - ${duration}ms`);
-      console.log('Request Headers:', req.headers);
-      
-      const reqBody = req.rawBody || (req.body ? JSON.stringify(req.body) : '');
-      console.log('Request Body:', reqBody);
-      console.log('Response Headers:', res.getHeaders());
-      console.log('Response Body:', res.locals?.__responseBody || '');
+      const ms = Date.now() - start;
+      console.log(`${req.method} ${req.originalUrl} -> ${res.statusCode} ${ms}ms`);
     });
     next();
   };
@@ -92,7 +61,6 @@ app.use(createRequestLogger());
 
 const mcpServerUrl = new URL(`http://${CONFIG.host}:${CONFIG.port}`);
 const oauthUrls = createOAuthUrls();
-const strictOAuth = CONFIG.strictOAuth;
 
 const oauthMetadata: OAuthMetadata = {
   ...oauthUrls,
@@ -101,7 +69,6 @@ const oauthMetadata: OAuthMetadata = {
 
 const tokenVerifier = {
   verifyAccessToken: async (token: string) => {
-    console.log('[auth] verifyAccessToken called');
     const endpoint = oauthMetadata.introspection_endpoint;
 
     if (!endpoint) {
@@ -118,13 +85,6 @@ const tokenVerifier = {
       params.set('client_secret', CONFIG.auth.clientSecret);
     }
     
-    const tokenPreview = `${token.slice(0, 12)}... (${token.length} chars)`;
-    console.log('[auth] introspection request', { 
-      endpoint, 
-      clientId: CONFIG.auth.clientId, 
-      hasClientSecret: !!CONFIG.auth.clientSecret, 
-      tokenPreview 
-    });
 
     let response: Response;
     try {
@@ -162,24 +122,19 @@ const tokenVerifier = {
       throw e;
     }
     
-    console.log('[auth] introspection response');
-    console.log(JSON.stringify(data, null, 2));
 
-    if (strictOAuth) {
-      console.log('[auth] strictOAuth enabled');
-      if (!data.aud) {
-        console.error('[auth] strictOAuth: missing aud');
-        throw new Error(`Resource Indicator (RFC8707) missing`);
-      }
-      const allowed = checkResourceAllowed({ requestedResource: data.aud, configuredResource: mcpServerUrl });
-      console.log('[auth] strictOAuth resource check', { 
-        requested: data.aud, 
-        configured: mcpServerUrl.toString(), 
-        allowed 
-      });
-      if (!allowed) {
-        throw new Error(`Expected resource indicator ${mcpServerUrl}, got: ${data.aud}`);
-      }
+    if (data.active === false) {
+      throw new Error('Inactive token');
+    }
+
+    if (!data.aud) {
+      throw new Error('Resource indicator (aud) missing');
+    }
+
+    const audiences: string[] = Array.isArray(data.aud) ? data.aud : [data.aud];
+    const allowed = audiences.some(a => checkResourceAllowed({ requestedResource: a, configuredResource: mcpServerUrl }));
+    if (!allowed) {
+      throw new Error(`None of the provided audiences are allowed. Expected ${mcpServerUrl}, got: ${audiences.join(', ')}`);
     }
 
     return {
