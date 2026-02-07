@@ -1,9 +1,9 @@
- 
 import 'dotenv/config';
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import cors from "cors";
@@ -11,6 +11,7 @@ import { mcpAuthMetadataRouter, getOAuthProtectedResourceMetadataUrl } from "@mo
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { checkResourceAllowed } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+
 const CONFIG = {
   host: process.env.HOST || "localhost",
   port: Number(process.env.PORT) || 3000,
@@ -197,60 +198,78 @@ function createMcpServer() {
   return server;
 }
 
-const mcpPostHandler = async (req: express.Request, res: express.Response) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  let transport: StreamableHTTPServerTransport;
+// Stdio mode (for npx/uvx)
+async function runStdioMode() {
+  const server = createMcpServer();
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("MCP Server running on stdio");
+}
 
-  if (sessionId && transports[sessionId]) {
-    transport = transports[sessionId];
-  } else if (!sessionId && isInitializeRequest(req.body)) {
-    transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (sessionId) => {
-        transports[sessionId] = transport;
-      },
-    });
+// HTTP mode (for testing)
+async function runHttpMode() {
+  const mcpPostHandler = async (req: express.Request, res: express.Response) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    let transport: StreamableHTTPServerTransport;
 
-    transport.onclose = () => {
-      if (transport.sessionId) {
-        delete transports[transport.sessionId];
-      }
-    };
+    if (sessionId && transports[sessionId]) {
+      transport = transports[sessionId];
+    } else if (!sessionId && isInitializeRequest(req.body)) {
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sessionId) => {
+          transports[sessionId] = transport;
+        },
+      });
 
-    const server = createMcpServer();
-    await server.connect(transport);
-  } else {
-    res.status(400).json({
-      jsonrpc: '2.0',
-      error: {
-        code: -32000,
-        message: 'Bad Request: No valid session ID provided',
-      },
-      id: null,
-    });
-    return;
-  }
+      transport.onclose = () => {
+        if (transport.sessionId) {
+          delete transports[transport.sessionId];
+        }
+      };
 
-  await transport.handleRequest(req, res, req.body);
-};
+      const server = createMcpServer();
+      await server.connect(transport);
+    } else {
+      res.status(400).json({
+        jsonrpc: '2.0',
+        error: {
+          code: -32000,
+          message: 'Bad Request: No valid session ID provided',
+        },
+        id: null,
+      });
+      return;
+    }
 
-const handleSessionRequest = async (req: express.Request, res: express.Response) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  if (!sessionId || !transports[sessionId]) {
-    res.status(400).send('Invalid or missing session ID');
-    return;
-  }
-  
-  const transport = transports[sessionId];
-  await transport.handleRequest(req, res);
-};
+    await transport.handleRequest(req, res, req.body);
+  };
 
-app.post('/', authMiddleware, mcpPostHandler);
-app.get('/', authMiddleware, handleSessionRequest);
-app.delete('/', authMiddleware, handleSessionRequest);
+  const handleSessionRequest = async (req: express.Request, res: express.Response) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).send('Invalid or missing session ID');
+      return;
+    }
+    
+    const transport = transports[sessionId];
+    await transport.handleRequest(req, res);
+  };
 
-app.listen(CONFIG.port, () => {
-  console.log(`🚀 MCP Server running on ${mcpServerUrl.origin}`);
-  console.log(`📡 MCP endpoint available at ${mcpServerUrl.origin}`);
-  console.log(`🔐 OAuth metadata available at ${getOAuthProtectedResourceMetadataUrl(mcpServerUrl)}`);
-});
+  app.post('/', authMiddleware, mcpPostHandler);
+  app.get('/', authMiddleware, handleSessionRequest);
+  app.delete('/', authMiddleware, handleSessionRequest);
+
+  app.listen(CONFIG.port, () => {
+    console.log(`🚀 MCP Server running on ${mcpServerUrl.origin}`);
+    console.log(`📡 MCP endpoint available at ${mcpServerUrl.origin}`);
+    console.log(`🔐 OAuth metadata available at ${getOAuthProtectedResourceMetadataUrl(mcpServerUrl)}`);
+  });
+}
+
+// Check if running in stdio mode (no HTTP transport argument)
+if (process.argv.includes('--transport') && process.argv.includes('stdio')) {
+  runStdioMode().catch(console.error);
+} else {
+  runHttpMode().catch(console.error);
+}
